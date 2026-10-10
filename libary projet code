@@ -1,0 +1,865 @@
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <FirebaseClient.h>
+#include <math.h>
+#include "driver/i2s.h"
+#include "ExampleFunctions.h"
+
+// =====================================================
+// WIFI
+// =====================================================
+
+#define WIFI_SSID     "Aman"
+#define WIFI_PASSWORD "aman6666"
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+#define API_KEY       "AIzaSyDPUAGYNt2iEvXb_-3oQUVydBdKqC5VAKQ"
+#define USER_EMAIL    "amanyadav963190@gmail.com"
+#define USER_PASSWORD "Aman@123"
+// =====================================================
+// REALTIME DATABASE
+// =====================================================
+
+#define DATABASE_URL "https://library-noise-monitor-default-rtdb.firebaseio.com"
+
+// =====================================================
+// TABLE
+// =====================================================
+
+#define TABLE_NUMBER 7
+
+// =====================================================
+// INMP441
+// =====================================================
+
+#define I2S_WS   25
+#define I2S_SD   33
+#define I2S_SCK  26
+
+#define I2S_PORT I2S_NUM_0
+
+#define SAMPLE_RATE 16000
+#define BUFFER_SIZE 1024
+
+// =====================================================
+// NOISE SETTINGS
+// =====================================================
+
+// Relative noise level at/above this value = noisy (LOUD)
+#define NOISE_LIMIT 40.0
+
+// Firebase update every 2 seconds
+const unsigned long SEND_INTERVAL = 2000;
+
+// =====================================================
+// FIREBASE OBJECTS
+// =====================================================
+
+UserAuth user_auth(
+  API_KEY,
+  USER_EMAIL,
+  USER_PASSWORD,
+  3000
+);
+
+FirebaseApp app;
+
+SSL_CLIENT ssl_client;
+
+using AsyncClient = AsyncClientClass;
+
+AsyncClient aClient(ssl_client);
+
+RealtimeDatabase Database;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+int violationCount = 0;
+
+bool previousNoisy = false;
+
+// Prevent multiple Firebase requests at same time
+bool firebaseWriteInProgress = false;
+
+unsigned long lastFirebaseSend = 0;
+
+// =====================================================
+// FIREBASE CALLBACK
+// =====================================================
+
+void processData(AsyncResult &aResult)
+{
+  if (!aResult.isResult())
+    return;
+
+  // ---------------------------------------------------
+  // EVENT
+  // ---------------------------------------------------
+
+  if (aResult.isEvent())
+  {
+    Firebase.printf(
+      "Event task: %s, msg: %s, code: %d\n",
+      aResult.uid().c_str(),
+      aResult.eventLog().message().c_str(),
+      aResult.eventLog().code()
+    );
+  }
+
+  // ---------------------------------------------------
+  // DEBUG
+  // ---------------------------------------------------
+
+  if (aResult.isDebug())
+  {
+    Firebase.printf(
+      "Debug task: %s, msg: %s\n",
+      aResult.uid().c_str(),
+      aResult.debug().c_str()
+    );
+  }
+
+  // ---------------------------------------------------
+  // ERROR
+  // ---------------------------------------------------
+
+  if (aResult.isError())
+  {
+    Firebase.printf(
+      "Firebase Error: %s, code: %d\n",
+      aResult.error().message().c_str(),
+      aResult.error().code()
+    );
+
+    // Allow next write after error
+    firebaseWriteInProgress = false;
+  }
+
+  // ---------------------------------------------------
+  // SUCCESS
+  // ---------------------------------------------------
+
+  if (aResult.available())
+  {
+    Firebase.printf(
+      "Firebase task: %s, payload: %s\n",
+      aResult.uid().c_str(),
+      aResult.c_str()
+    );
+
+    Serial.println("Firebase update SUCCESS!");
+
+    // Allow next write
+    firebaseWriteInProgress = false;
+  }
+}
+
+// =====================================================
+// I2S SETUP
+// =====================================================
+
+void setupI2S()
+{
+  Serial.println();
+  Serial.println("Initializing INMP441...");
+
+  i2s_config_t i2s_config = {};
+
+  i2s_config.mode =
+    (i2s_mode_t)(
+      I2S_MODE_MASTER |
+      I2S_MODE_RX
+    );
+
+  i2s_config.sample_rate =
+    SAMPLE_RATE;
+
+  i2s_config.bits_per_sample =
+    I2S_BITS_PER_SAMPLE_32BIT;
+
+  i2s_config.channel_format =
+    I2S_CHANNEL_FMT_ONLY_LEFT;
+
+  i2s_config.communication_format =
+    I2S_COMM_FORMAT_I2S;
+
+  i2s_config.intr_alloc_flags =
+    ESP_INTR_FLAG_LEVEL1;
+
+  i2s_config.dma_buf_count = 8;
+
+  i2s_config.dma_buf_len =
+    BUFFER_SIZE;
+
+  i2s_config.use_apll = false;
+
+  i2s_config.tx_desc_auto_clear = false;
+
+  // INMP441 does not use MCLK
+  i2s_config.fixed_mclk = 0;
+
+  esp_err_t result =
+    i2s_driver_install(
+      I2S_PORT,
+      &i2s_config,
+      0,
+      NULL
+    );
+
+  if (result != ESP_OK)
+  {
+    Serial.print("I2S driver error: ");
+    Serial.println(result);
+    return;
+  }
+
+  i2s_pin_config_t pin_config = {};
+
+  pin_config.bck_io_num =
+    I2S_SCK;
+
+  pin_config.ws_io_num =
+    I2S_WS;
+
+  pin_config.data_out_num =
+    I2S_PIN_NO_CHANGE;
+
+  pin_config.data_in_num =
+    I2S_SD;
+
+  pin_config.mck_io_num =
+    I2S_PIN_NO_CHANGE;
+
+  result =
+    i2s_set_pin(
+      I2S_PORT,
+      &pin_config
+    );
+
+  if (result != ESP_OK)
+  {
+    Serial.print("I2S pin error: ");
+    Serial.println(result);
+    return;
+  }
+
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  Serial.println(
+    "I2S configured successfully."
+  );
+
+  Serial.println(
+    "INMP441 Ready."
+  );
+}
+
+// =====================================================
+// READ NOISE LEVEL
+// =====================================================
+
+float readNoiseLevel()
+{
+  int32_t samples[BUFFER_SIZE];
+  size_t bytesRead = 0;
+
+  esp_err_t result = i2s_read(
+    I2S_PORT,
+    samples,
+    sizeof(samples),
+    &bytesRead,
+    portMAX_DELAY
+  );
+
+  if (result != ESP_OK || bytesRead == 0)
+  {
+    return 0.0;
+  }
+
+  int sampleCount = bytesRead / sizeof(int32_t);
+
+  if (sampleCount <= 0)
+  {
+    return 0.0;
+  }
+
+  // Calculate RMS
+  double sumSquares = 0.0;
+
+  for (int i = 0; i < sampleCount; i++)
+  {
+    // Convert 32-bit I2S sample to 24-bit value
+    int32_t sample = samples[i] >> 8;
+
+    sumSquares += (double)sample * (double)sample;
+  }
+
+  double rms = sqrt(sumSquares / sampleCount);
+
+  // Convert RMS to relative noise level
+  float noise = 20.0 * log10(rms + 1.0);
+
+  // Scale to 0-100 range
+  noise = noise / 6.0;
+
+  // Keep value between 0 and 100
+  if (noise < 0.0)
+  {
+    noise = 0.0;
+  }
+
+  if (noise > 100.0)
+  {
+    noise = 100.0;
+  }
+
+  return noise;
+}
+
+  // =====================================================
+// STATUS
+
+// =====================================================
+
+String getStatus(float noise)
+{
+  if (noise < 15.0)
+    return "NORMAL";
+
+  else if (noise < 25.0)
+    return "WARNING";
+
+  else if (noise < 30.0)
+    return "LOUD";
+
+  else
+    return "VERY LOUD";
+}
+
+// =====================================================
+// SEND DATA TO REALTIME DATABASE
+// =====================================================
+
+void sendToFirebase(
+  float noise,
+  String status,
+  bool isNoisy,
+  bool violation,
+  int violations
+)
+{
+  // Do not start another Firebase request
+  // while previous request is running.
+
+  if (firebaseWriteInProgress)
+  {
+    Serial.println(
+      "Firebase write already in progress..."
+    );
+
+    return;
+  }
+
+  String path =
+    "/table_" +
+    String(TABLE_NUMBER);
+
+  String json = "{";
+
+  json +=
+    "\"isNoisy\":" +
+    String(
+      isNoisy ? "true" : "false"
+    );
+
+  json +=
+    ",\"noiseLevel\":" +
+    String(
+      noise,
+      1
+    );
+
+  json +=
+    ",\"status\":\"" +
+    status +
+    "\"";
+
+  json +=
+    ",\"tableNumber\":" +
+    String(
+      TABLE_NUMBER
+    );
+
+  json +=
+    ",\"violation\":" +
+    String(
+      violation ? "true" : "false"
+    );
+
+  json +=
+    ",\"violationCount\":" +
+    String(
+      violations
+    );
+
+  json += "}";
+
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "Sending data to Realtime Database"
+  );
+
+  Serial.print(
+    "Path: "
+  );
+
+  Serial.println(
+    path
+  );
+
+  Serial.print(
+    "JSON: "
+  );
+
+  Serial.println(
+    json
+  );
+
+  // Mark request as running
+  firebaseWriteInProgress = true;
+
+  Database.set<object_t>(
+    aClient,
+    path,
+    object_t(json),
+    processData,
+    "noiseUpdate"
+  );
+}
+
+// =====================================================
+// WIFI CONNECT
+// =====================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.println(
+    "Connecting to WiFi..."
+  );
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int attempts = 0;
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    attempts < 30
+  )
+  {
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  )
+  {
+    Serial.println(
+      "WiFi Connected!"
+    );
+
+    Serial.print(
+      "IP Address: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    Serial.print(
+      "RSSI: "
+    );
+
+    Serial.print(
+      WiFi.RSSI()
+    );
+
+    Serial.println(
+      " dBm"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "WiFi connection FAILED!"
+    );
+  }
+}
+
+// =====================================================
+// WIFI RECONNECT
+// =====================================================
+
+void checkWiFi()
+{
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+  {
+    Serial.println();
+    Serial.println(
+      "WiFi disconnected!"
+    );
+
+    WiFi.disconnect();
+
+    delay(100);
+
+    WiFi.begin(
+      WIFI_SSID,
+      WIFI_PASSWORD
+    );
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+  // Startup delay
+  delay(3000);
+
+  Serial.println();
+
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "     GGI LIBRARY NOISE MONITOR"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+
+  // ===================================================
+  // INMP441
+  // ===================================================
+
+  setupI2S();
+
+  // ===================================================
+  // WIFI
+  // ===================================================
+
+  connectWiFi();
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+  {
+    Serial.println(
+      "WiFi not connected."
+    );
+
+    return;
+  }
+
+  // ===================================================
+  // FIREBASE
+  // ===================================================
+
+  Serial.println();
+
+  Firebase.printf(
+    "Firebase Client v%s\n",
+    FIREBASE_CLIENT_VERSION
+  );
+
+  Serial.println(
+    "Initializing Firebase..."
+  );
+
+  // SSL
+  set_ssl_client_insecure_and_buffer(
+    ssl_client
+  );
+
+  // Authentication
+  initializeApp(
+    aClient,
+    app,
+    getAuth(user_auth),
+    auth_debug_print,
+    "authTask"
+  );
+
+  // Bind Realtime Database
+  app.getApp<RealtimeDatabase>(
+    Database
+  );
+
+  // Database URL
+  Database.url(
+    DATABASE_URL
+  );
+
+  Serial.println(
+    "Firebase initialization started."
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "--------------------------------------"
+  );
+
+  Serial.print(
+    "Table Number : "
+  );
+
+  Serial.println(
+    TABLE_NUMBER
+  );
+
+  Serial.println(
+    "Database     : Realtime Database"
+  );
+
+  Serial.println(
+    "Path         : /table_7"
+  );
+
+  Serial.println(
+    "Noise Limit  : 40.0"
+  );
+
+  Serial.println(
+    "Send Interval: 2000 ms"
+  );
+
+  Serial.println(
+    "--------------------------------------"
+  );
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // ===================================================
+  // Firebase background processing
+  // ===================================================
+
+  app.loop();
+
+  // ===================================================
+  // WIFI
+  // ===================================================
+
+  checkWiFi();
+
+  // ===================================================
+  // READ NOISE
+  // ===================================================
+
+  float noise =
+    readNoiseLevel();
+
+  // ===================================================
+  // STATUS
+  // ===================================================
+
+  String status =
+    getStatus(
+      noise
+    );
+
+  // ===================================================
+  // NOISY CONDITION
+  // ===================================================
+
+  bool isNoisy =
+    noise >= NOISE_LIMIT;
+
+  // ===================================================
+  // VIOLATION
+  // ===================================================
+
+  bool violation = false;
+
+  // Count only when noise starts
+  if (
+    isNoisy &&
+    !previousNoisy
+  )
+  {
+    violationCount++;
+
+    violation = true;
+
+    Serial.println();
+
+    Serial.println(
+      "!!! NEW NOISE VIOLATION !!!"
+    );
+  }
+
+  // Save current state
+  previousNoisy =
+    isNoisy;
+
+  // ===================================================
+  // SERIAL MONITOR
+  // ===================================================
+
+  Serial.println();
+
+  Serial.println(
+    "--------------------------------------"
+  );
+
+  Serial.print(
+    "Table Number : "
+  );
+
+  Serial.println(
+    TABLE_NUMBER
+  );
+
+  Serial.print(
+    "Noise Level  : "
+  );
+
+  Serial.print(
+    noise,
+    1
+  );
+
+  Serial.println(
+    " / 100"
+  );
+
+  Serial.print(
+    "Status       : "
+  );
+
+  Serial.println(
+    status
+  );
+
+  Serial.print(
+    "isNoisy      : "
+  );
+
+  Serial.println(
+    isNoisy ?
+    "true" :
+    "false"
+  );
+
+  Serial.print(
+    "Violation    : "
+  );
+
+  Serial.println(
+    violation ?
+    "true" :
+    "false"
+  );
+
+  Serial.print(
+    "ViolationCount: "
+  );
+
+  Serial.println(
+    violationCount
+  );
+
+  // ===================================================
+  // FIREBASE
+  // ===================================================
+
+  if (
+    app.ready()
+  )
+  {
+    Serial.println(
+      "Firebase: Authentication READY"
+    );
+
+    unsigned long currentMillis =
+      millis();
+
+    if (
+      currentMillis -
+      lastFirebaseSend >=
+      SEND_INTERVAL
+    )
+    {
+      lastFirebaseSend =
+        currentMillis;
+
+      sendToFirebase(
+        noise,
+        status,
+        isNoisy,
+        violation,
+        violationCount
+      );
+    }
+  }
+  else
+  {
+    Serial.println(
+      "Firebase: Authentication not ready..."
+    );
+  }
+
+  Serial.println(
+    "--------------------------------------"
+  );
+
+  // Slow Serial output
+  // but Firebase app.loop()
+  // is still called frequently.
+
+  delay(1000);
+}
