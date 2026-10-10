@@ -1,0 +1,22 @@
+# Local secrets and configuration
+secrets.h
+credentials.h
+.env
+.env.*
+!.env.example
+firebase-service-account*.json
+service-account*.json
+*.pem
+*.key
+
+# Arduino IDE and build outputs
+build/
+.cache/
+*.elf
+*.hex
+*.bin
+*.map
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
